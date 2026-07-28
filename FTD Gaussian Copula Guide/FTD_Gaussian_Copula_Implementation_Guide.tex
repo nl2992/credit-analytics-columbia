@@ -1,0 +1,1117 @@
+
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.25cm]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs,longtable,array,tabularx}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{microtype}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{caption}
+
+\definecolor{navy}{RGB}{24,49,83}
+\definecolor{lightgray}{RGB}{245,246,248}
+\definecolor{midgray}{RGB}{90,98,108}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=navy,
+  urlcolor=navy,
+  citecolor=navy,
+  pdftitle={Building a First-to-Default Pricer from Bootstrapped CDS Curves},
+  pdfauthor={Nigel Li}
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\textcolor{midgray}{FTD Pricer Design Guide}}
+\rhead{\textcolor{midgray}{Gaussian Copula}}
+\cfoot{\thepage}
+
+\titleformat{\section}{\Large\bfseries\color{navy}}{\thesection}{0.7em}{}
+\titleformat{\subsection}{\large\bfseries\color{navy}}{\thesubsection}{0.7em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries}{\thesubsubsection}{0.7em}{}
+
+\setlist[itemize]{leftmargin=1.4em,itemsep=0.25em,topsep=0.35em}
+\setlist[enumerate]{leftmargin=1.6em,itemsep=0.3em,topsep=0.35em}
+
+\newcommand{\DF}{D(0,t)}
+\newcommand{\Q}{\mathbb{Q}}
+\newcommand{\E}{\mathbb{E}^{\mathbb{Q}}}
+\newcommand{\ind}{\mathbf{1}}
+\newcommand{\FTD}{\mathrm{FTD}}
+\newcommand{\PV}{\mathrm{PV}}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{lightgray},
+  frame=single,
+  rulecolor=\color{lightgray},
+  breaklines=true,
+  columns=fullflexible,
+  showstringspaces=false
+}
+
+\begin{document}
+
+\begin{titlepage}
+\centering
+\vspace*{2.0cm}
+{\Huge\bfseries\color{navy} Building a First-to-Default Pricer\par}
+\vspace{0.4cm}
+{\Large From Bootstrapped CDS Curves to a Gaussian-Copula Basket Model\par}
+\vspace{1.3cm}
+{\large Implementation guide based on the existing CDS curve and pricer workflow\par}
+\vfill
+\begin{tabular}{rl}
+\textbf{Core inputs:} & SOFR discount factors, single-name CDS curves, recoveries \\
+\textbf{Dependence model:} & One-factor or full-matrix Gaussian copula \\
+\textbf{Primary engine:} & Monte Carlo, benchmarked by one-factor quadrature \\
+\textbf{Target product:} & First-to-default and general $i$-th-to-default baskets
+\end{tabular}
+\vfill
+{\large Nigel Li\par}
+{\small July 2026\par}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+\section{Purpose and Scope}
+
+This guide explains how to extend an existing single-name CDS curve bootstrap and CDS pricer into a first-to-default (FTD) basket pricer. The existing CDS work already supplies the marginal default distribution for each reference entity. The additional FTD model must introduce a joint dependence structure, determine the first default time and identity, and value the resulting premium and protection legs.
+
+The implementation should be designed in two layers:
+
+\begin{enumerate}
+    \item \textbf{Single-name layer:} discount factors, piecewise hazard rates, survival probabilities, default probabilities, premium-leg PV01 and protection-leg valuation.
+    \item \textbf{Basket layer:} correlated default-time generation, first-default selection, basket cash flows, fair FTD spread, correlation calibration and risk.
+\end{enumerate}
+
+The intended first production version is a one-factor Gaussian-copula Monte Carlo model with a separate one-dimensional quadrature benchmark. The framework can subsequently be generalised from first-to-default to $i$-th-to-default baskets.
+
+\section{Economic Interpretation of FTD Derivatives}
+
+An FTD basket allows an investor to buy or sell protection on the earliest default in a portfolio of reference names. Since the protection seller is exposed to the first default among several names, the fair FTD spread is normally materially above the simple average single-name spread. Market descriptions sometimes characterise this as approximately two to three times the basket-average spread, but this is only a heuristic. The actual multiple depends on:
+
+\begin{itemize}
+    \item the number of names;
+    \item each name's CDS term structure;
+    \item recovery assumptions;
+    \item basket maturity;
+    \item correlation;
+    \item concentration and heterogeneity;
+    \item coupon and accrual conventions.
+\end{itemize}
+
+The FTD spread is generally negatively related to default correlation. When correlation is low, each name is a relatively independent opportunity for the basket to experience at least one default. When correlation is high, the names behave more like a single common credit exposure, reducing the probability that at least one name defaults by a given horizon.
+
+For identical names with maturity default probability $p$:
+
+\[
+\Q(\tau_{(1)} \leq T)=1-(1-p)^n
+\]
+
+under independence, whereas under near-perfect positive dependence the probability approaches $p$ rather than $1-(1-p)^n$.
+
+An $i$-th-to-default basket may contain a small bespoke portfolio or a larger basket, commonly between three and twenty-five names. The FTD is the special case $i=1$.
+
+\section{Existing Single-Name Foundation}
+
+\subsection{Piecewise-Constant Hazard Rates}
+
+For reference name $i$, assume the CDS bootstrap produces the piecewise-constant hazard function
+
+\[
+\lambda_i(t)=
+\begin{cases}
+\lambda_{i,1}, & 0<t\leq T_1,\\
+\lambda_{i,2}, & T_1<t\leq T_2,\\
+\vdots & \\
+\lambda_{i,K}, & T_{K-1}<t\leq T_K.
+\end{cases}
+\]
+
+For $t\in(T_{k-1},T_k]$, the cumulative hazard is
+
+\[
+\Lambda_i(t)
+=
+\sum_{j=1}^{k-1}
+\lambda_{i,j}(T_j-T_{j-1})
++
+\lambda_{i,k}(t-T_{k-1}).
+\]
+
+The risk-neutral survival probability is
+
+\[
+S_i(t)
+=
+\Q(\tau_i>t)
+=
+\exp[-\Lambda_i(t)],
+\]
+
+and the cumulative default probability is
+
+\[
+F_i(t)
+=
+\Q(\tau_i\leq t)
+=
+1-S_i(t).
+\]
+
+The bucket hazard $\lambda_{i,k}$ is a conditional instantaneous default intensity. Informally, it represents the rate of default during bucket $k$, conditional on survival to that point. It is not itself an unconditional bucket default probability.
+
+The conditional probability of surviving from $T_{k-1}$ to $T_k$ is
+
+\[
+\Q(\tau_i>T_k\mid \tau_i>T_{k-1})
+=
+e^{-\lambda_{i,k}(T_k-T_{k-1})}.
+\]
+
+Therefore, the conditional probability of default during that bucket is
+
+\[
+1-e^{-\lambda_{i,k}(T_k-T_{k-1})}.
+\]
+
+\subsection{What the Existing CDS Pricer Already Provides}
+
+The current CDS curve and pricer framework should already contain, either explicitly or implicitly:
+
+\begin{itemize}
+    \item valuation date and settlement conventions;
+    \item SOFR discount factors $D(0,t)$;
+    \item quoted CDS maturities and par spreads;
+    \item recovery assumptions;
+    \item premium schedules and day-count fractions;
+    \item piecewise hazard rates;
+    \item cumulative hazards;
+    \item survival and default probabilities;
+    \item CDS premium-leg risky PV01;
+    \item CDS protection-leg PV;
+    \item repricing errors against quoted CDS spreads.
+\end{itemize}
+
+These are precisely the marginal inputs required by the Gaussian copula. The FTD extension should reuse them rather than recalibrate the single-name curves inside the basket model.
+
+\section{FTD Contract Definition}
+
+For an $n$-name basket, define each reference entity's default time as $\tau_i$. The first default time is
+
+\[
+\tau_{(1)}
+=
+\min(\tau_1,\ldots,\tau_n).
+\]
+
+The identity of the first defaulting name is
+
+\[
+K
+=
+\arg\min_{i\in\{1,\ldots,n\}}\tau_i.
+\]
+
+The protection buyer pays the periodic FTD spread $s_{\FTD}$ until the earliest of maturity and first default. If name $K$ defaults first before maturity, the protection buyer receives
+
+\[
+N_K(1-R_K),
+\]
+
+where $N_K$ is the contractual notional attached to that name and $R_K$ is its recovery rate.
+
+The fair spread solves
+
+\[
+\PV_{\mathrm{premium}}(s_{\FTD})
+=
+\PV_{\mathrm{protection}}.
+\]
+
+Since the premium leg is linear in spread,
+
+\[
+\boxed{
+s_{\FTD}
+=
+\frac{\PV_{\mathrm{protection}}}
+{\mathrm{FTD\ risky\ annuity}}
+}
+\]
+
+or, in basis points,
+
+\[
+s_{\FTD}^{\mathrm{bps}}
+=
+10{,}000
+\frac{\PV_{\mathrm{protection}}}
+{\mathrm{FTD\ risky\ annuity}}.
+\]
+
+\section{Why a Copula Is Required}
+
+The bootstrapped CDS curves determine each marginal distribution $F_i(t)$, but they do not determine the joint law
+
+\[
+\Q(\tau_1\leq t_1,\ldots,\tau_n\leq t_n).
+\]
+
+A copula joins the marginal distributions into a joint distribution while preserving each marginal curve. Under a Gaussian copula,
+
+\[
+C_{\Sigma}(u_1,\ldots,u_n)
+=
+\Phi_{\Sigma}
+\left(
+\Phi^{-1}(u_1),\ldots,\Phi^{-1}(u_n)
+\right),
+\]
+
+where $\Phi_{\Sigma}$ is the multivariate standard normal CDF with correlation matrix $\Sigma$.
+
+The implementation therefore follows the chain
+
+\[
+\text{CDS spreads}
+\rightarrow
+\lambda_i(t)
+\rightarrow
+F_i(t)
+\rightarrow
+\text{Gaussian copula}
+\rightarrow
+(\tau_1,\ldots,\tau_n)
+\rightarrow
+\tau_{(1)}
+\rightarrow
+\text{FTD cash flows}.
+\]
+
+\section{Gaussian-Copula Default-Time Simulation}
+
+\subsection{Full Correlation-Matrix Form}
+
+Let
+
+\[
+\mathbf Z=(Z_1,\ldots,Z_n)^\top
+\sim N(\mathbf 0,\Sigma).
+\]
+
+Compute a Cholesky factorisation
+
+\[
+\Sigma=LL^\top,
+\]
+
+generate independent standard normals
+
+\[
+\boldsymbol{\varepsilon}\sim N(\mathbf 0,I),
+\]
+
+and set
+
+\[
+\mathbf Z=L\boldsymbol{\varepsilon}.
+\]
+
+Convert each latent normal to a uniform:
+
+\[
+U_i=\Phi(Z_i).
+\]
+
+Then convert the uniform into a default time:
+
+\[
+\tau_i=F_i^{-1}(U_i).
+\]
+
+This construction preserves the calibrated marginal default distribution:
+
+\[
+\Q(\tau_i\leq t)=F_i(t).
+\]
+
+\subsection{One-Factor Form}
+
+A simpler and highly practical first implementation is
+
+\[
+Z_i
+=
+\beta_iY
++
+\sqrt{1-\beta_i^2}\,\varepsilon_i,
+\]
+
+where $Y$ and the $\varepsilon_i$ are independent standard normal variables. Then
+
+\[
+\operatorname{Corr}(Z_i,Z_j)=\beta_i\beta_j.
+\]
+
+In the homogeneous case,
+
+\[
+\beta_i=\sqrt{\rho}
+\]
+
+for all $i$, giving
+
+\[
+Z_i
+=
+\sqrt{\rho}\,Y
++
+\sqrt{1-\rho}\,\varepsilon_i
+\]
+
+and pairwise latent correlation $\rho$.
+
+The parameter $\rho$ is a latent Gaussian correlation. It is not directly a CDS-spread correlation, hazard-rate correlation, default-time Pearson correlation or observed equity-return correlation.
+
+\subsection{Default-Time Inversion for Piecewise Hazards}
+
+Given $U_i$, define the exponential threshold
+
+\[
+H_i=-\ln(1-U_i).
+\]
+
+Since
+
+\[
+F_i(t)=1-e^{-\Lambda_i(t)},
+\]
+
+the simulated default time solves
+
+\[
+\Lambda_i(\tau_i)=H_i.
+\]
+
+Find bucket $k$ such that
+
+\[
+\Lambda_i(T_{k-1})<H_i\leq\Lambda_i(T_k).
+\]
+
+Then
+
+\[
+\boxed{
+\tau_i
+=
+T_{k-1}
++
+\frac{
+H_i-\Lambda_i(T_{k-1})
+}{
+\lambda_{i,k}
+}
+}
+\]
+
+provided $\lambda_{i,k}>0$.
+
+If $H_i$ lies beyond the final calibrated maturity, the model requires an explicit extrapolation rule. The simplest is a flat terminal hazard:
+
+\[
+\lambda_i(t)=\lambda_{i,K},
+\qquad t>T_K.
+\]
+
+\section{Monte Carlo Valuation}
+
+For path $m$, generate all default times and identify
+
+\[
+\tau_{(1)}^{(m)}
+=
+\min_i\tau_i^{(m)},
+\qquad
+K^{(m)}
+=
+\arg\min_i\tau_i^{(m)}.
+\]
+
+\subsection{Protection Leg}
+
+The pathwise protection PV is
+
+\[
+\PV_{\mathrm{prot}}^{(m)}
+=
+\ind_{\{\tau_{(1)}^{(m)}\leq T\}}
+D(0,\tau_{(1)}^{(m)})
+N_{K^{(m)}}(1-R_{K^{(m)}}).
+\]
+
+The Monte Carlo estimate is
+
+\[
+\PV_{\mathrm{prot}}
+\approx
+\frac{1}{M}
+\sum_{m=1}^{M}
+\PV_{\mathrm{prot}}^{(m)}.
+\]
+
+\subsection{Scheduled Premium Leg}
+
+For premium dates $t_1,\ldots,t_J$ and accrual fractions $\alpha_j$, the scheduled risky annuity on path $m$ is
+
+\[
+A_{\mathrm{sched}}^{(m)}
+=
+\sum_{j=1}^{J}
+\alpha_jD(0,t_j)
+\ind_{\{\tau_{(1)}^{(m)}>t_j\}}.
+\]
+
+\subsection{Accrued Premium on Default}
+
+If
+
+\[
+t_{j-1}<\tau_{(1)}^{(m)}\leq t_j,
+\]
+
+the accrued contribution is
+
+\[
+A_{\mathrm{accr}}^{(m)}
+=
+D(0,\tau_{(1)}^{(m)})
+\operatorname{DCF}(t_{j-1},\tau_{(1)}^{(m)}).
+\]
+
+Therefore,
+
+\[
+A_{\FTD}
+\approx
+\frac{1}{M}
+\sum_{m=1}^{M}
+\left(
+A_{\mathrm{sched}}^{(m)}
++
+A_{\mathrm{accr}}^{(m)}
+\right).
+\]
+
+The fair spread is then
+
+\[
+s_{\FTD}
+=
+\frac{\PV_{\mathrm{prot}}}{A_{\FTD}}.
+\]
+
+\section{One-Factor Quadrature Benchmark}
+
+Monte Carlo should be the general engine, but the one-factor model also provides a strong independent benchmark.
+
+Define the default threshold
+
+\[
+a_i(t)=\Phi^{-1}(F_i(t)).
+\]
+
+Conditional on $Y=y$,
+
+\[
+Z_i\mid Y=y
+\sim
+N(\beta_i y,1-\beta_i^2).
+\]
+
+Hence the conditional default probability is
+
+\[
+p_i(t\mid y)
+=
+\Phi\left(
+\frac{a_i(t)-\beta_i y}
+{\sqrt{1-\beta_i^2}}
+\right),
+\]
+
+and conditional survival is
+
+\[
+q_i(t\mid y)=1-p_i(t\mid y).
+\]
+
+Conditional independence gives
+
+\[
+\Q(\tau_{(1)}>t\mid Y=y)
+=
+\prod_{i=1}^{n}q_i(t\mid y).
+\]
+
+Integrating over $Y$ gives the basket survival probability
+
+\[
+\boxed{
+S_{\FTD}(t)
+=
+\int_{-\infty}^{\infty}
+\phi(y)
+\prod_{i=1}^{n}
+\Phi\left(
+\frac{\beta_i y-\Phi^{-1}(F_i(t))}
+{\sqrt{1-\beta_i^2}}
+\right)
+dy
+}.
+\]
+
+This is a one-dimensional integral regardless of basket size and can be evaluated efficiently with Gauss--Hermite quadrature.
+
+For common recovery and notional,
+
+\[
+\PV_{\mathrm{prot}}
+=
+N(1-R)
+\int_0^T D(0,t)\,d[1-S_{\FTD}(t)].
+\]
+
+The scheduled annuity is
+
+\[
+A_{\mathrm{sched}}
+=
+\sum_{j=1}^{J}
+\alpha_jD(0,t_j)S_{\FTD}(t_j).
+\]
+
+A simple midpoint approximation for accrual is
+
+\[
+A_{\mathrm{accr}}
+\approx
+\sum_{j=1}^{J}
+D(0,\bar t_j)
+\frac{\alpha_j}{2}
+\left[
+S_{\FTD}(t_{j-1})-S_{\FTD}(t_j)
+\right].
+\]
+
+\section{Workbook and Sheet Architecture}
+
+\subsection{Important Repository Limitation}
+
+The public repository confirms the broader curve-bootstrapping project and its SOFR/Excel implementation documentation. However, the binary CDS workbook's internal tabs were not available through the repository connector used for this review. Therefore, the tab names below are a professional target architecture and mapping for the CDS Pricer 2.2 workflow, not a claim that these are the exact existing sheet names.
+
+Where an existing sheet already performs the stated function, retain it and add the specified output columns rather than duplicating it.
+
+\subsection{Recommended Existing-Sheet Mapping}
+
+\begin{longtable}{p{3.3cm}p{5.5cm}p{6.0cm}}
+\toprule
+\textbf{Sheet / role} & \textbf{Current CDS function} & \textbf{FTD use and required extension} \\
+\midrule
+\endhead
+
+\texttt{Control} &
+Valuation date, trade date, settlement date, day-count assumptions, recovery, curve selection and global switches. &
+Add basket maturity, basket notional, number of names, correlation model, scalar $\rho$ or matrix selector, simulation count, seed, antithetic switch and extrapolation rule. \\
+
+\texttt{Discount Curve} &
+Stores SOFR pillar dates, discount factors, zero rates and interpolation inputs. &
+No conceptual change. Expose a clean function or lookup range returning $D(0,t)$ for arbitrary coupon and simulated default dates. \\
+
+\texttt{CDS Market Data} &
+Contains single-name CDS spreads by maturity, recovery assumptions and possibly upfront quotes. &
+Convert to a basket input table with one row per name and one column per quoted maturity. Add name-specific notional, recovery and sector metadata. \\
+
+\texttt{CDS Schedule} &
+Builds coupon dates, accrual fractions, protection start and maturity conventions. &
+Create one master FTD premium schedule because the basket terminates on first default. Confirm all names use compatible contract dates or define a common basket schedule explicitly. \\
+
+\texttt{Hazard Bootstrap} &
+Solves sequentially for piecewise hazards that reprice each CDS quote. &
+Run independently for every basket name. Output a rectangular table indexed by name and hazard bucket. \\
+
+\texttt{Survival Curve} &
+Calculates cumulative hazard, survival probability and default probability at curve nodes or coupon dates. &
+Expose $F_i(t)$ and $F_i^{-1}(u)$. Add cumulative-hazard breakpoint arrays used by default-time inversion. \\
+
+\texttt{CDS Pricer} &
+Calculates premium leg, accrued premium, protection leg, par spread and PV for one name. &
+Use as a single-name validation engine. A one-name FTD must reproduce this sheet's par CDS spread under identical conventions. \\
+
+\texttt{Calibration Check} &
+Shows quote repricing errors and curve monotonicity. &
+Add basket-wide pass/fail flags: non-negative hazards, decreasing survival, marginal simulation checks and maximum repricing error. \\
+
+\bottomrule
+\end{longtable}
+
+\subsection{New FTD Sheets to Add}
+
+\begin{longtable}{p{3.4cm}p{5.4cm}p{6.0cm}}
+\toprule
+\textbf{New sheet} & \textbf{Purpose} & \textbf{Principal contents} \\
+\midrule
+\endhead
+
+\texttt{FTD Basket Input} &
+Defines the product and constituent-level terms. &
+Name, weight/notional, recovery, CDS curve reference, maturity, currency, seniority, correlation loading $\beta_i$, inclusion flag. \\
+
+\texttt{FTD Correlation} &
+Stores and validates the dependence model. &
+Scalar $\rho$, one-factor loadings, or full matrix $\Sigma$; symmetry checks; diagonal checks; eigenvalues; Cholesky factor. \\
+
+\texttt{FTD Randoms} &
+Generates systemic and idiosyncratic random variables. &
+$Y$, $\varepsilon_i$, $Z_i$, $U_i$ by simulation path. Prefer an external Python engine for large path counts. \\
+
+\texttt{FTD Default Times} &
+Maps copula uniforms through each marginal curve. &
+$H_i=-\ln(1-U_i)$, selected hazard bucket, inverted $\tau_i$, first default time and first default identity. \\
+
+\texttt{FTD Cash Flows} &
+Calculates pathwise premium and protection legs. &
+Scheduled survival indicators, accrued premium, loss-given-default, discount factors and pathwise PVs. \\
+
+\texttt{FTD Results} &
+Reports price and fair spread. &
+Protection PV, risky annuity, fair spread, standard error, confidence interval, expected first-default time and first-name contribution. \\
+
+\texttt{FTD Sensitivities} &
+Calculates risk and scenario analysis. &
+Correlation01, constituent CS01, recovery sensitivity, IR01, basket-name contribution and correlation grid. \\
+
+\texttt{FTD Validation} &
+Runs theoretical and numerical test cases. &
+One-name equivalence, zero-correlation identity, near-one-correlation limit, marginal preservation and Monte Carlo versus quadrature. \\
+
+\bottomrule
+\end{longtable}
+
+\section{Detailed Excel Implementation}
+
+\subsection{Step 1: Standardise the Name-by-Bucket Hazard Table}
+
+Create a table with one row per name and two aligned blocks:
+
+\begin{enumerate}
+    \item hazard rates $\lambda_{i,k}$;
+    \item cumulative hazards $\Lambda_i(T_k)$.
+\end{enumerate}
+
+For name $i$ and bucket $k$:
+
+\[
+\Lambda_i(T_k)
+=
+\Lambda_i(T_{k-1})
++
+\lambda_{i,k}(T_k-T_{k-1}).
+\]
+
+In Excel, conceptually:
+
+\begin{lstlisting}
+=CumulativeHazard_Previous
+ + Hazard_Current * (BucketEnd - BucketStart)
+\end{lstlisting}
+
+Ensure all time differences use the same year-fraction convention as the bootstrap.
+
+\subsection{Step 2: Add Inverse Default-Time Logic}
+
+For each path and name:
+
+\begin{lstlisting}
+U = NORM.S.DIST(Z, TRUE)
+H = -LN(1-U)
+\end{lstlisting}
+
+Use \texttt{XMATCH} or \texttt{MATCH} to find the first cumulative-hazard breakpoint greater than or equal to $H$.
+
+Conceptually:
+
+\begin{lstlisting}
+Bucket = XMATCH(H, CumulativeHazardRow, 1)
+Tau = BucketStart
+    + (H - CumHazardAtBucketStart) / HazardInBucket
+\end{lstlisting}
+
+Care is required because approximate-match modes differ across Excel versions. Test boundary values exactly equal to each cumulative-hazard breakpoint.
+
+\subsection{Step 3: Generate Correlated Normals}
+
+For a homogeneous one-factor model:
+
+\begin{lstlisting}
+SystemicY = NORM.S.INV(RAND())
+IdioEps  = NORM.S.INV(RAND())
+Z_i      = SQRT(rho)*SystemicY + SQRT(1-rho)*IdioEps
+\end{lstlisting}
+
+For reproducibility, ordinary volatile \texttt{RAND()} formulas are not ideal. A Python engine should generate and save a fixed random-number matrix using a specified seed.
+
+\subsection{Step 4: Select the First Default}
+
+For each path:
+
+\begin{lstlisting}
+FirstDefaultTime = MIN(DefaultTime_Name1:DefaultTime_NameN)
+FirstNameIndex   = XMATCH(FirstDefaultTime,
+                          DefaultTime_Name1:DefaultTime_NameN,
+                          0)
+\end{lstlisting}
+
+Simultaneous defaults have zero probability under a continuous Gaussian-copula model. Nevertheless, implement a deterministic tie rule for numerical robustness.
+
+\subsection{Step 5: Calculate Pathwise Protection PV}
+
+\begin{lstlisting}
+=IF(FirstDefaultTime<=Maturity,
+    DF_at_FirstDefault
+    * Notional_of_FirstName
+    * (1-Recovery_of_FirstName),
+    0)
+\end{lstlisting}
+
+The discount factor at a simulated date must be interpolated from the SOFR curve using the same interpolation convention as the existing pricer.
+
+\subsection{Step 6: Calculate Scheduled Premium PV01}
+
+For coupon date $t_j$:
+
+\begin{lstlisting}
+=AccrualFactor_j
+ * DF_j
+ * --(FirstDefaultTime > CouponDate_j)
+\end{lstlisting}
+
+Sum across all coupon dates.
+
+\subsection{Step 7: Calculate Accrued Premium}
+
+Find the coupon interval containing the first default time. Then calculate
+
+\begin{lstlisting}
+=IF(FirstDefaultTime<=Maturity,
+    DF_at_FirstDefault
+    * YearFrac(PreviousCouponDate, FirstDefaultTime),
+    0)
+\end{lstlisting}
+
+Use the contractual accrual convention, not a simple calendar-day fraction unless that is exactly the convention in the current CDS pricer.
+
+\subsection{Step 8: Aggregate and Solve Fair Spread}
+
+\begin{lstlisting}
+ProtectionPV = AVERAGE(PathwiseProtectionPV)
+RiskyAnnuity = AVERAGE(PathwiseScheduledPV01
+                     + PathwiseAccruedPV01)
+FairSpread   = ProtectionPV / RiskyAnnuity
+FairSpreadBp = 10000 * FairSpread
+\end{lstlisting}
+
+Also report the Monte Carlo standard error:
+
+\[
+\operatorname{SE}(\bar X)
+=
+\frac{s_X}{\sqrt{M}}.
+\]
+
+For the ratio defining the fair spread, use either common-path bumping or a delta-method estimate if a spread confidence interval is required.
+
+\section{Recommended Python Calculation Engine}
+
+Excel is appropriate for transparency, controls and reporting. The simulation itself should preferably be implemented in Python and returned to Excel as summarised outputs.
+
+\subsection{Core Data Structures}
+
+\begin{lstlisting}[language=Python]
+@dataclass
+class HazardCurve:
+    breakpoints: np.ndarray
+    hazards: np.ndarray
+    cumulative_hazards: np.ndarray
+    recovery: float
+
+@dataclass
+class FTDBasket:
+    names: list[str]
+    notionals: np.ndarray
+    curves: list[HazardCurve]
+    maturity: float
+    premium_dates: np.ndarray
+    accrual_fractions: np.ndarray
+\end{lstlisting}
+
+\subsection{Default-Time Inversion}
+
+\begin{lstlisting}[language=Python]
+def inverse_default_times(u, breakpoints, hazards, cumulative):
+    h = -np.log1p(-u)
+    k = np.searchsorted(cumulative, h, side="left")
+
+    tau = np.empty_like(h)
+
+    inside = k < len(hazards)
+    k_in = k[inside]
+
+    previous_cum = np.where(
+        k_in == 0, 0.0, cumulative[k_in - 1]
+    )
+    previous_time = np.where(
+        k_in == 0, 0.0, breakpoints[k_in - 1]
+    )
+
+    tau[inside] = (
+        previous_time
+        + (h[inside] - previous_cum) / hazards[k_in]
+    )
+
+    beyond = ~inside
+    tau[beyond] = (
+        breakpoints[-1]
+        + (h[beyond] - cumulative[-1]) / hazards[-1]
+    )
+
+    return tau
+\end{lstlisting}
+
+\subsection{One-Factor Simulation}
+
+\begin{lstlisting}[language=Python]
+rng = np.random.default_rng(seed)
+
+y = rng.standard_normal((n_paths, 1))
+eps = rng.standard_normal((n_paths, n_names))
+
+z = beta.reshape(1, -1) * y + np.sqrt(
+    1.0 - beta.reshape(1, -1) ** 2
+) * eps
+
+u = scipy.stats.norm.cdf(z)
+\end{lstlisting}
+
+Use vectorised inversion by name, obtain the row-wise minimum, and calculate pathwise cash flows.
+
+\section{Correlation Input and Calibration}
+
+Single-name CDS quotes do not determine correlation. Correlation must come from an additional market input or scenario assumption.
+
+\subsection{Implied FTD Correlation}
+
+If a market FTD spread is available, solve
+
+\[
+s_{\mathrm{model}}(\rho)
+-
+s_{\mathrm{market}}
+=
+0.
+\]
+
+Use bisection or Brent's method on a bounded interval such as
+
+\[
+\rho\in[0,0.999].
+\]
+
+The model spread should generally decline with $\rho$ for an FTD basket, but verify monotonicity numerically for heterogeneous portfolios and contractual features.
+
+\subsection{Alternative Inputs}
+
+Possible alternatives include:
+
+\begin{itemize}
+    \item historical equity or asset-return correlations;
+    \item sector-factor models;
+    \item index-tranche-implied dependence;
+    \item a conservative scenario grid.
+\end{itemize}
+
+Historical correlations are physical-measure estimates and are not automatically risk-neutral. They should be labelled as assumptions rather than market calibrations.
+
+\section{Risk Measures}
+
+The minimum risk report should include:
+
+\begin{description}
+    \item[Correlation01:] Change in PV or fair spread for a one-percentage-point change in $\rho$.
+    \item[Constituent CS01:] Change in basket PV after bumping one name's CDS spread curve by one basis point and re-bootstrapping that name.
+    \item[Parallel basket CS01:] Simultaneous one-basis-point bump to all constituent CDS curves.
+    \item[Recovery sensitivity:] Change in PV after changing one or all recovery assumptions.
+    \item[IR01:] Change in PV after a one-basis-point shift to the discount curve.
+    \item[Name contribution:] Expected discounted loss contribution by first-defaulting name.
+\end{description}
+
+Use common random numbers for all bumped Monte Carlo calculations. This materially reduces noise in finite-difference sensitivities.
+
+\section{Validation Framework}
+
+\subsection{Single-Name Equivalence}
+
+For $n=1$, the FTD fair spread must equal the existing single-name CDS par spread, subject to identical timing, accrual, discounting and recovery conventions.
+
+\subsection{Zero-Correlation Check}
+
+At $\rho=0$,
+
+\[
+S_{\FTD}(t)
+=
+\prod_{i=1}^{n}S_i(t).
+\]
+
+The Monte Carlo result should converge to this analytical identity.
+
+\subsection{Perfect-Dependence Limit}
+
+For identical names and $\rho\rightarrow1$, the FTD should approach a single-name CDS because all latent variables and default times converge.
+
+\subsection{Marginal Preservation}
+
+For each name and date $t$,
+
+\[
+\frac{1}{M}
+\sum_{m=1}^{M}
+\ind_{\{\tau_i^{(m)}\leq t\}}
+\approx
+F_i(t).
+\]
+
+Changing correlation must not alter the unconditional marginal default curve.
+
+\subsection{Monte Carlo versus Quadrature}
+
+Under the one-factor model with common recovery and notional, Monte Carlo and Gauss--Hermite quadrature should agree within Monte Carlo sampling error.
+
+\subsection{Correlation-Matrix Checks}
+
+For a full matrix model, require:
+
+\[
+\Sigma=\Sigma^\top,
+\qquad
+\Sigma_{ii}=1,
+\qquad
+\Sigma\succeq0.
+\]
+
+If the matrix is not positive semidefinite, Cholesky decomposition will fail or produce an invalid dependence structure.
+
+\section{Extension to $i$-th-to-Default}
+
+The simulation framework generalises directly. Sort each path's default times:
+
+\[
+\tau_{(1)}
+\leq
+\tau_{(2)}
+\leq
+\cdots
+\leq
+\tau_{(n)}.
+\]
+
+For an $i$-th-to-default contract, termination and protection payment occur at $\tau_{(i)}$ rather than $\tau_{(1)}$.
+
+In Python:
+
+\begin{lstlisting}[language=Python]
+ith_time = np.partition(default_times, i - 1, axis=1)[:, i - 1]
+ith_name = np.argpartition(default_times, i - 1, axis=1)[:, i - 1]
+\end{lstlisting}
+
+The premium leg survives until the $i$-th default. The protection payment uses the recovery and notional of the $i$-th defaulting name. For $i>1$, correlation sensitivity can differ substantially from the FTD case because the product requires multiple defaults rather than merely one.
+
+\section{Recommended Build Order}
+
+\begin{enumerate}
+    \item Freeze and validate the existing SOFR discount curve.
+    \item Validate each single-name hazard curve by repricing its quoted CDS spreads.
+    \item Refactor the hazard output into a standard name-by-bucket table.
+    \item Implement and unit-test inverse default-time mapping.
+    \item Build a homogeneous one-factor Gaussian-copula simulator.
+    \item Add first-default time and identity selection.
+    \item Add scheduled premium, accrued premium and protection cash flows.
+    \item Produce fair spread, PV and Monte Carlo error.
+    \item Implement the one-factor quadrature benchmark.
+    \item Add correlation scenarios and implied-correlation calibration.
+    \item Add constituent CS01, correlation01, recovery risk and IR01.
+    \item Generalise from first-to-default to $i$-th-to-default.
+\end{enumerate}
+
+\section{Model Limitations}
+
+The Gaussian copula is useful because it is tractable and preserves calibrated single-name marginals. Its limitations must remain visible:
+
+\begin{itemize}
+    \item a constant latent correlation does not capture correlation skew;
+    \item the Gaussian copula has no lower-tail dependence beyond that implied by linear Gaussian correlation;
+    \item static default-time copulas do not model spread dynamics;
+    \item contagion after a realised default is not represented;
+    \item historical correlations may differ materially from risk-neutral dependence;
+    \item recovery is often treated as deterministic even though recovery and default dependence may be material;
+    \item bespoke-basket correlation calibration may be underdetermined.
+\end{itemize}
+
+The model should therefore report correlation scenarios and concentration measures rather than presenting one correlation assumption as uniquely correct.
+
+\section{Final Target Architecture}
+
+The completed system should have the following separation:
+
+\[
+\boxed{
+\begin{array}{c}
+\text{SOFR discount curve} \\
++ \\
+\text{single-name CDS bootstraps} \\
+\downarrow \\
+\text{validated marginal survival curves} \\
+\downarrow \\
+\text{Gaussian dependence engine} \\
+\downarrow \\
+\text{correlated default times} \\
+\downarrow \\
+\text{first or $i$-th default event} \\
+\downarrow \\
+\text{premium and protection cash flows} \\
+\downarrow \\
+\text{PV, fair spread, calibration and risk}
+\end{array}
+}
+\]
+
+The existing CDS Pricer 2.2 should remain the authoritative single-name calibration and validation layer. The FTD module should consume its hazard and survival outputs, not recreate them independently. This gives a transparent lineage from market CDS spreads to each constituent's marginal curve and then to the basket valuation.
+
+\section*{References}
+
+\begin{enumerate}
+    \item D. X. Li, ``On Default Correlation: A Copula Function Approach,'' \textit{Journal of Fixed Income}, 2000. Available through SSRN: \url{https://papers.ssrn.com/sol3/papers.cfm?abstract_id=187289}.
+    \item ISDA CDS Standard Model, documentation and production model resources: \url{https://www.cdsmodel.com/documentation.html}.
+    \item N. Li, \texttt{curve-bootstrapping} repository: \url{https://github.com/nl2992/curve-bootstrapping}.
+\end{enumerate}
+
+\end{document}
